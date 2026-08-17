@@ -208,22 +208,64 @@ class Database:
                     update_id INTEGER PRIMARY KEY,
                     processed_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS daily_bonuses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL,
+                    amount INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL,
+                    FOREIGN KEY(telegram_id) REFERENCES users(telegram_id)
+                );
                 """
             )
+            existing_columns = {
+                row["name"]
+                for row in self.connection.execute("PRAGMA table_info(users)").fetchall()
+            }
+            migrations = {
+                "blocked": "INTEGER NOT NULL DEFAULT 0",
+                "bonus_count": "INTEGER NOT NULL DEFAULT 0",
+                "manual_bonus_credits": "INTEGER NOT NULL DEFAULT 0",
+                "referrer_id": "INTEGER",
+                "last_seen_at": "TEXT",
+            }
+            for column, definition in migrations.items():
+                if column not in existing_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE users ADD COLUMN {column} {definition}"
+                    )
 
-    def ensure_user(self, user: Any) -> sqlite3.Row:
+    def ensure_user(self, user: Any, referrer_id: Optional[int] = None) -> sqlite3.Row:
         now = iso_now()
         with self.lock, self.connection:
             self.connection.execute(
                 """
-                INSERT INTO users(telegram_id, username, first_name, created_at)
-                VALUES(?, ?, ?, ?)
+                INSERT INTO users(
+                    telegram_id, username, first_name, referrer_id, created_at, last_seen_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?)
                 ON CONFLICT(telegram_id) DO UPDATE SET
                     username=excluded.username,
-                    first_name=excluded.first_name
+                    first_name=excluded.first_name,
+                    last_seen_at=excluded.last_seen_at
                 """,
-                (user.id, user.username, user.first_name or "", now),
+                (
+                    user.id,
+                    user.username,
+                    user.first_name or "",
+                    referrer_id if referrer_id and referrer_id != user.id else None,
+                    now,
+                    now,
+                ),
             )
+            if referrer_id and referrer_id != user.id:
+                self.connection.execute(
+                    """
+                    UPDATE users SET referrer_id=?
+                    WHERE telegram_id=? AND referrer_id IS NULL
+                    """,
+                    (referrer_id, user.id),
+                )
             return self.connection.execute(
                 "SELECT * FROM users WHERE telegram_id=?", (user.id,)
             ).fetchone()
@@ -347,14 +389,19 @@ class Database:
             try:
                 self.connection.execute("BEGIN IMMEDIATE")
                 row = self.connection.execute(
-                    "SELECT last_bonus_at FROM users WHERE telegram_id=?", (telegram_id,)
+                    """
+                    SELECT last_bonus_at, manual_bonus_credits
+                    FROM users WHERE telegram_id=?
+                    """,
+                    (telegram_id,),
                 ).fetchone()
                 if not row:
                     self.connection.rollback()
                     return False, None
                 previous = parse_iso(row["last_bonus_at"])
                 now = utc_now()
-                if previous and now - previous < timedelta(hours=24):
+                manual_bonus = int(row["manual_bonus_credits"] or 0)
+                if manual_bonus <= 0 and previous and now - previous < timedelta(hours=24):
                     self.connection.rollback()
                     return False, timedelta(hours=24) - (now - previous)
                 if not self.credit_in_transaction(
@@ -362,9 +409,33 @@ class Database:
                 ):
                     self.connection.rollback()
                     return False, None
+                if manual_bonus > 0:
+                    self.connection.execute(
+                        """
+                        UPDATE users
+                        SET manual_bonus_credits=manual_bonus_credits-1,
+                            bonus_count=bonus_count+1
+                        WHERE telegram_id=?
+                        """,
+                        (telegram_id,),
+                    )
+                    source = "admin_bonus"
+                else:
+                    self.connection.execute(
+                        """
+                        UPDATE users
+                        SET last_bonus_at=?, bonus_count=bonus_count+1
+                        WHERE telegram_id=?
+                        """,
+                        (now.isoformat(), telegram_id),
+                    )
+                    source = "daily"
                 self.connection.execute(
-                    "UPDATE users SET last_bonus_at=? WHERE telegram_id=?",
-                    (now.isoformat(), telegram_id),
+                    """
+                    INSERT INTO daily_bonuses(telegram_id, amount, source, claimed_at)
+                    VALUES(?, ?, ?, ?)
+                    """,
+                    (telegram_id, DAILY_BONUS, source, now.isoformat()),
                 )
                 self.connection.commit()
                 return True, None
@@ -372,6 +443,136 @@ class Database:
                 self.connection.rollback()
                 LOGGER.exception("Ошибка ежедневного бонуса")
                 return False, None
+
+    def bonus_available(self, telegram_id: int) -> bool:
+        with self.lock:
+            row = self.connection.execute(
+                """
+                SELECT last_bonus_at, manual_bonus_credits
+                FROM users WHERE telegram_id=?
+                """,
+                (telegram_id,),
+            ).fetchone()
+        if not row:
+            return False
+        if int(row["manual_bonus_credits"] or 0) > 0:
+            return True
+        previous = parse_iso(row["last_bonus_at"])
+        return previous is None or utc_now() - previous >= timedelta(hours=24)
+
+    def admin_balance_change(
+        self, telegram_id: int, action: str, amount: int, admin_id: int
+    ) -> tuple[bool, Optional[int]]:
+        if amount < 0 or amount > MAX_GAVA or action not in {"add", "remove", "set"}:
+            return False, None
+        with self.lock:
+            try:
+                self.connection.execute("BEGIN IMMEDIATE")
+                row = self.connection.execute(
+                    "SELECT balance FROM users WHERE telegram_id=?", (telegram_id,)
+                ).fetchone()
+                if not row:
+                    self.connection.rollback()
+                    return False, None
+                current = int(row["balance"])
+                new_balance = (
+                    current + amount
+                    if action == "add"
+                    else current - amount
+                    if action == "remove"
+                    else amount
+                )
+                if new_balance < 0 or new_balance > MAX_GAVA:
+                    self.connection.rollback()
+                    return False, None
+                difference = new_balance - current
+                if difference:
+                    self.connection.execute(
+                        "UPDATE users SET balance=? WHERE telegram_id=?",
+                        (new_balance, telegram_id),
+                    )
+                    self.connection.execute(
+                        """
+                        INSERT INTO transactions(
+                            telegram_id, type, amount, description, created_at
+                        ) VALUES(?, ?, ?, ?, ?)
+                        """,
+                        (
+                            telegram_id,
+                            f"admin_{action}",
+                            difference,
+                            f"Изменение баланса администратором {admin_id}",
+                            iso_now(),
+                        ),
+                    )
+                self.connection.commit()
+                return True, new_balance
+            except sqlite3.Error:
+                self.connection.rollback()
+                LOGGER.exception("Ошибка изменения баланса администратором")
+                return False, None
+
+    def admin_bonus_change(self, telegram_id: int, amount: int, add: bool) -> bool:
+        if amount <= 0 or amount > 1_000_000:
+            return False
+        with self.lock, self.connection:
+            row = self.connection.execute(
+                "SELECT manual_bonus_credits FROM users WHERE telegram_id=?",
+                (telegram_id,),
+            ).fetchone()
+            if not row:
+                return False
+            current = int(row["manual_bonus_credits"] or 0)
+            new_value = current + amount if add else current - amount
+            if new_value < 0:
+                return False
+            self.connection.execute(
+                "UPDATE users SET manual_bonus_credits=? WHERE telegram_id=?",
+                (new_value, telegram_id),
+            )
+            return True
+
+    def set_blocked(self, telegram_id: int, blocked: bool) -> bool:
+        with self.lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE users SET blocked=? WHERE telegram_id=?",
+                (1 if blocked else 0, telegram_id),
+            )
+            return cursor.rowcount > 0
+
+    def search_users(self, term: str, limit: int = 20) -> list[sqlite3.Row]:
+        normalized = term.strip().lstrip("@")
+        with self.lock:
+            if normalized.isdigit():
+                return list(
+                    self.connection.execute(
+                        "SELECT * FROM users WHERE telegram_id=? LIMIT ?",
+                        (int(normalized), limit),
+                    ).fetchall()
+                )
+            like = f"%{normalized.lower()}%"
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT * FROM users
+                    WHERE lower(COALESCE(username, '')) LIKE ?
+                       OR lower(first_name) LIKE ?
+                    ORDER BY balance DESC LIMIT ?
+                    """,
+                    (like, like, limit),
+                ).fetchall()
+            )
+
+    def list_users(self, offset: int = 0, limit: int = 12) -> list[sqlite3.Row]:
+        with self.lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT * FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?
+                    """,
+                    (limit, offset),
+                ).fetchall()
+            )
 
     def credit_in_transaction(
         self, telegram_id: int, amount: int, tx_type: str, description: str
@@ -611,7 +812,7 @@ class Database:
                 if duel["turn_user_id"] != user_id:
                     self.connection.rollback()
                     return "turn", duel
-                hit = random.random() < 0.35
+                hit = random.random() < 0.55
                 if hit:
                     winner = user_id
                     payout = duel["wager"] * 2
@@ -649,7 +850,7 @@ class Database:
                 LOGGER.exception("Ошибка выстрела в дуэли")
                 return "error", None
 
-    def redeem_promo(self, code: str, telegram_id: int) -> tuple[str, int]:
+    def redeem_promo(self, code: str, telegram_id: int) -> tuple[str, int, int, int]:
         with self.lock:
             try:
                 self.connection.execute("BEGIN IMMEDIATE")
@@ -658,14 +859,14 @@ class Database:
                 ).fetchone()
                 if not promo or not promo["active"]:
                     self.connection.rollback()
-                    return "missing", 0
+                    return "missing", 0, 0, 0
                 if promo["uses"] >= promo["usage_limit"]:
                     self.connection.rollback()
-                    return "limit", 0
+                    return "limit", 0, 0, int(promo["usage_limit"])
                 expires = parse_iso(promo["expires_at"])
                 if expires and utc_now() >= expires:
                     self.connection.rollback()
-                    return "expired", 0
+                    return "expired", 0, max(0, promo["usage_limit"] - promo["uses"]), int(promo["usage_limit"])
                 try:
                     self.connection.execute(
                         """
@@ -676,7 +877,7 @@ class Database:
                     )
                 except sqlite3.IntegrityError:
                     self.connection.rollback()
-                    return "used", 0
+                    return "used", 0, max(0, promo["usage_limit"] - promo["uses"]), int(promo["usage_limit"])
                 self.connection.execute(
                     "UPDATE promo_codes SET uses=uses+1 WHERE id=? AND uses<usage_limit",
                     (promo["id"],),
@@ -685,13 +886,14 @@ class Database:
                     telegram_id, promo["reward"], "promo", f"Промокод #{promo['code']}"
                 ):
                     self.connection.rollback()
-                    return "error", 0
+                    return "error", 0, 0, int(promo["usage_limit"])
                 self.connection.commit()
-                return "ok", promo["reward"]
+                remaining = max(0, int(promo["usage_limit"]) - int(promo["uses"]) - 1)
+                return "ok", promo["reward"], remaining, int(promo["usage_limit"])
             except sqlite3.Error:
                 self.connection.rollback()
                 LOGGER.exception("Ошибка активации промокода")
-                return "error", 0
+                return "error", 0, 0, 0
 
     def create_promo(
         self,
@@ -732,7 +934,11 @@ class Database:
         with self.lock:
             return list(
                 self.connection.execute(
-                    "SELECT * FROM users ORDER BY balance DESC, telegram_id ASC LIMIT ?",
+                    """
+                    SELECT * FROM users
+                    WHERE blocked=0
+                    ORDER BY balance DESC, telegram_id ASC LIMIT ?
+                    """,
                     (limit,),
                 ).fetchall()
             )
@@ -749,15 +955,35 @@ class Database:
         with self.lock:
             queries = {
                 "users": "SELECT COUNT(*) AS value FROM users",
+                "active_users": """
+                    SELECT COUNT(*) AS value FROM users
+                    WHERE blocked=0 AND COALESCE(last_seen_at, created_at) >= ?
+                """,
+                "blocked_users": "SELECT COUNT(*) AS value FROM users WHERE blocked=1",
                 "circulation": "SELECT COALESCE(SUM(balance), 0) AS value FROM users",
                 "active_games": "SELECT COUNT(*) AS value FROM games WHERE status='active'",
                 "active_duels": "SELECT COUNT(*) AS value FROM duels WHERE status='active'",
                 "promos": "SELECT COUNT(*) AS value FROM promo_codes WHERE active=1",
+                "promo_remaining": """
+                    SELECT COALESCE(SUM(MAX(usage_limit - uses, 0)), 0) AS value
+                    FROM promo_codes WHERE active=1
+                """,
+                "promo_used": """
+                    SELECT COALESCE(SUM(uses), 0) AS value
+                    FROM promo_codes
+                """,
+                "promo_total": """
+                    SELECT COALESCE(SUM(usage_limit), 0) AS value
+                    FROM promo_codes
+                """,
             }
-            return {
-                key: int(self.connection.execute(query).fetchone()["value"])
-                for key, query in queries.items()
-            }
+            result: dict[str, int] = {}
+            for key, query in queries.items():
+                params = (
+                    (utc_now() - timedelta(days=30)).isoformat(),
+                ) if key == "active_users" else ()
+                result[key] = int(self.connection.execute(query, params).fetchone()["value"])
+            return result
 
 
 DB = Database(DATABASE_PATH)
@@ -768,6 +994,19 @@ def ensure_user(update: Update) -> Optional[sqlite3.Row]:
     if not update.effective_user:
         return None
     return DB.ensure_user(update.effective_user)
+
+
+def is_blocked(telegram_id: int) -> bool:
+    row = DB.user(telegram_id)
+    return bool(row and row["blocked"])
+
+
+def balance_keyboard(telegram_id: int) -> Optional[InlineKeyboardMarkup]:
+    if not DB.bonus_available(telegram_id):
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🎁 Бонус", callback_data="bonus")]]
+    )
 
 
 def start_keyboard() -> InlineKeyboardMarkup:
@@ -845,10 +1084,58 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("➕ Создать промокод", callback_data="admin:create")],
             [
+                InlineKeyboardButton("👥 Пользователи", callback_data="admin:users:0"),
+                InlineKeyboardButton("🔎 Поиск", callback_data="admin:search"),
+            ],
+            [
                 InlineKeyboardButton("📋 Промокоды", callback_data="admin:list"),
                 InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
             ],
         ]
+    )
+
+
+def admin_user_keyboard(row: sqlite3.Row) -> InlineKeyboardMarkup:
+    user_id = row["telegram_id"]
+    blocked = bool(row["blocked"])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("➕ Баланс", callback_data=f"admin:action:add:{user_id}"),
+                InlineKeyboardButton("➖ Баланс", callback_data=f"admin:action:remove:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("💰 Установить", callback_data=f"admin:action:set:{user_id}"),
+                InlineKeyboardButton("🎁 Добавить бонус", callback_data=f"admin:action:bonus_add:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("🗑 Убрать бонус", callback_data=f"admin:action:bonus_remove:{user_id}"),
+                InlineKeyboardButton(
+                    "✅ Разблокировать" if blocked else "🚫 Заблокировать",
+                    callback_data=f"admin:action:{'unblock' if blocked else 'block'}:{user_id}",
+                ),
+            ],
+            [InlineKeyboardButton("⬅️ В админ-панель", callback_data="admin:back")],
+        ]
+    )
+
+
+def admin_user_text(row: sqlite3.Row) -> str:
+    referrer = row["referrer_id"] or "нет"
+    return (
+        "👤 Пользователь\n"
+        f"ID: {row['telegram_id']}\n"
+        f"Username: @{row['username']}" if row["username"] else
+        "👤 Пользователь\n"
+        f"ID: {row['telegram_id']}\n"
+        f"Username: нет"
+    ) + (
+        f"\nИмя: {row['first_name'] or 'нет'}\n"
+        f"Баланс: {fmt_gava(row['balance'])}\n"
+        f"Бонусов получено: {row['bonus_count']}\n"
+        f"Доступных бонусов: {row['manual_bonus_credits']}\n"
+        f"Реферер ID: {referrer}\n"
+        f"Статус: {'заблокирован' if row['blocked'] else 'активен'}"
     )
 
 
@@ -870,8 +1157,17 @@ async def safe_answer(query: Any, text: str, show_alert: bool = False) -> None:
 
 
 async def send_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    row = ensure_user(update)
+    user = update.effective_user
+    if not user or not update.effective_message:
+        return
+    referrer_id = None
+    if context.args and context.args[0].isdigit():
+        referrer_id = int(context.args[0])
+    row = DB.ensure_user(user, referrer_id)
     if not row or not update.effective_message:
+        return
+    if row["blocked"] and user.id != ADMIN_ID:
+        await update.effective_message.reply_text("❌ Твой аккаунт заблокирован.")
         return
     await update.effective_message.reply_text(
         "🎮 Добро пожаловать в GAVA!\n"
@@ -883,10 +1179,10 @@ async def send_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def show_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ensure_user(update)
+    row = ensure_user(update)
     if not update.effective_message:
         return
-    if update.effective_user and update.effective_user.id == ADMIN_ID:
+    if update.effective_user and update.effective_user.id == ADMIN_ID and row:
         await update.effective_message.reply_text("🔐 Панель администратора", reply_markup=admin_keyboard())
     else:
         await update.effective_message.reply_text("❌ Доступ запрещён.")
@@ -1077,7 +1373,96 @@ async def admin_callback(query: Any, action: str) -> None:
     if query.from_user.id != ADMIN_ID:
         await safe_answer(query, "Доступ запрещён.", True)
         return
-    if action == "create":
+    if action.startswith("users"):
+        parts = action.split(":")
+        offset = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        rows = DB.list_users(offset)
+        if not rows:
+            await safe_edit(
+                query,
+                "👥 Пользователей на этой странице нет.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ В админ-панель", callback_data="admin:back")]]
+                ),
+            )
+            return
+        lines = [f"👥 Пользователи {offset + 1}–{offset + len(rows)}:"]
+        buttons = []
+        for row in rows:
+            lines.append(
+                f"{row['telegram_id']} — {user_label(row)} — {fmt_gava(row['balance'])}"
+            )
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"Открыть {user_label(row)}",
+                        callback_data=f"admin:user:{row['telegram_id']}",
+                    )
+                ]
+            )
+        navigation = []
+        if offset >= 12:
+            navigation.append(
+                InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:users:{offset - 12}")
+            )
+        if len(rows) == 12:
+            navigation.append(
+                InlineKeyboardButton("Далее ➡️", callback_data=f"admin:users:{offset + 12}")
+            )
+        if navigation:
+            buttons.append(navigation)
+        buttons.append([InlineKeyboardButton("⬅️ В админ-панель", callback_data="admin:back")])
+        await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
+    elif action == "search":
+        ADMIN_STATES[query.from_user.id] = {"step": "user_search"}
+        await safe_answer(query, "Введите ID или username пользователя.")
+        await safe_edit(query, "🔎 Отправьте Telegram ID или username для поиска:")
+    elif action.startswith("user:"):
+        user_id_text = action.split(":", 1)[1]
+        if not user_id_text.isdigit():
+            await safe_answer(query, "Некорректный ID.", True)
+            return
+        row = DB.user(int(user_id_text))
+        if not row:
+            await safe_answer(query, "Пользователь не найден.", True)
+            return
+        await safe_edit(query, admin_user_text(row), admin_user_keyboard(row))
+    elif action.startswith("action:"):
+        parts = action.split(":")
+        if len(parts) != 3 or not parts[2].isdigit():
+            await safe_answer(query, "Некорректное действие.", True)
+            return
+        action_name, user_id = parts[1], int(parts[2])
+        row = DB.user(user_id)
+        if not row:
+            await safe_answer(query, "Пользователь не найден.", True)
+            return
+        if action_name == "block":
+            DB.set_blocked(user_id, True)
+            row = DB.user(user_id)
+            await safe_answer(query, "Пользователь заблокирован.")
+            await safe_edit(query, admin_user_text(row), admin_user_keyboard(row))
+        elif action_name == "unblock":
+            DB.set_blocked(user_id, False)
+            row = DB.user(user_id)
+            await safe_answer(query, "Пользователь разблокирован.")
+            await safe_edit(query, admin_user_text(row), admin_user_keyboard(row))
+        elif action_name in {"add", "remove", "set", "bonus_add", "bonus_remove"}:
+            ADMIN_STATES[query.from_user.id] = {
+                "step": "user_amount",
+                "action": action_name,
+                "target_id": user_id,
+            }
+            prompt = (
+                "Введите количество бонусов:"
+                if action_name.startswith("bonus_")
+                else "Введите сумму GAVA:"
+            )
+            await safe_answer(query, "Ожидаю сумму.")
+            await safe_edit(query, f"👤 {user_label(row)}\n{prompt}")
+        else:
+            await safe_answer(query, "Неизвестное действие.", True)
+    elif action == "create":
         ADMIN_STATES[query.from_user.id] = {"step": "code"}
         await safe_answer(query, "Начинаем создание промокода.")
         await safe_edit(query, "Введите промокод, например #GAVA100:")
@@ -1091,9 +1476,10 @@ async def admin_callback(query: Any, action: str) -> None:
             buttons = []
             for promo in promos:
                 state = "включён" if promo["active"] else "выключен"
+                remaining = max(0, promo["usage_limit"] - promo["uses"])
                 lines.append(
                     f"#{promo['code']} — {fmt_gava(promo['reward'])}, "
-                    f"{promo['uses']}/{promo['usage_limit']}, {state}"
+                    f"осталось {remaining}/{promo['usage_limit']}, {state}"
                 )
                 buttons.append(
                     [
@@ -1112,10 +1498,14 @@ async def admin_callback(query: Any, action: str) -> None:
             query,
             "📊 Статистика бота\n\n"
             f"👥 Пользователей: {stats['users']}\n"
+            f"🟢 Активных за 30 дней: {stats['active_users']}\n"
+            f"🚫 Заблокированных: {stats['blocked_users']}\n"
             f"💰 GAVA в обороте: {fmt_gava(stats['circulation'])}\n"
             f"🎮 Активных игр: {stats['active_games']}\n"
             f"⚔️ Активных дуэлей: {stats['active_duels']}\n"
-            f"🎟 Активных промокодов: {stats['promos']}",
+            f"🎟 Активных промокодов: {stats['promos']}\n"
+            f"🎟 Промокодов использовано: {stats['promo_used']}\n"
+            f"🎟 Промокодов осталось: {stats['promo_remaining']}/{stats['promo_total']}",
             admin_keyboard(),
         )
     elif action == "back":
@@ -1128,6 +1518,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not query:
         return
     ensure_user(update)
+    if is_blocked(query.from_user.id) and query.from_user.id != ADMIN_ID:
+        await safe_answer(query, "Твой аккаунт заблокирован.", True)
+        return
     data = query.data or ""
     if data == "noop":
         await safe_answer(query, "Эта кнопка уже неактивна.", True)
@@ -1165,7 +1558,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ADMIN_STATES.pop(query.from_user.id, None)
         await safe_edit(query, "Создание промокода отменено.", admin_keyboard())
     elif data.startswith("admin:"):
-        await admin_callback(query, data.split(":")[1])
+        await admin_callback(query, data[len("admin:"):])
 
 
 async def finish_promo_creation(query: Any) -> None:
@@ -1200,6 +1593,74 @@ async def handle_admin_input(update: Update, text: str) -> bool:
     if not state:
         return False
     step = state.get("step")
+    if step == "user_search":
+        rows = DB.search_users(text)
+        ADMIN_STATES.pop(user.id, None)
+        if not rows:
+            await message.reply_text("❌ Пользователь не найден.", reply_markup=admin_keyboard())
+            return True
+        if len(rows) == 1:
+            row = rows[0]
+            await message.reply_text(admin_user_text(row), reply_markup=admin_user_keyboard(row))
+            return True
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    f"{user_label(row)} — {row['telegram_id']}",
+                    callback_data=f"admin:user:{row['telegram_id']}",
+                )
+            ]
+            for row in rows
+        ]
+        buttons.append([InlineKeyboardButton("⬅️ В админ-панель", callback_data="admin:back")])
+        await message.reply_text(
+            f"🔎 Найдено пользователей: {len(rows)}",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return True
+    if step == "user_amount":
+        action = state["action"]
+        target_id = int(state["target_id"])
+        if action.startswith("bonus_"):
+            if not text.strip().isdigit() or not 0 < int(text.strip()) <= 1_000_000:
+                await message.reply_text("❌ Введи положительное количество бонусов:")
+                return True
+            count = int(text.strip())
+            success = DB.admin_bonus_change(
+                target_id, count, add=action == "bonus_add"
+            )
+            result_text = (
+                "✅ Бонусы обновлены."
+                if success
+                else "❌ Не удалось изменить бонусы."
+            )
+        else:
+            raw = text.strip().replace(",", "").replace(" ", "").replace("_", "")
+            if not raw.isdigit():
+                await message.reply_text("❌ Введи целое неотрицательное число GAVA:")
+                return True
+            amount = int(raw)
+            if action != "set" and amount <= 0:
+                await message.reply_text("❌ Сумма должна быть положительной:")
+                return True
+            if amount > MAX_GAVA:
+                await message.reply_text("❌ Сумма превышает допустимый предел:")
+                return True
+            success, new_balance = DB.admin_balance_change(
+                target_id, action, amount, user.id
+            )
+            result_text = (
+                f"✅ Баланс обновлён: {fmt_gava(new_balance or 0)}"
+                if success
+                else "❌ Нельзя установить отрицательный баланс или превысить лимит."
+            )
+        ADMIN_STATES.pop(user.id, None)
+        row = DB.user(target_id)
+        await message.reply_text(
+            result_text,
+            reply_markup=admin_user_keyboard(row) if row else admin_keyboard(),
+        )
+        return True
     if step == "code":
         code = text.strip().lstrip("#").lower()
         if not re.fullmatch(r"[a-z0-9]+", code):
@@ -1308,16 +1769,16 @@ async def start_instant_game(update: Update, context: ContextTypes.DEFAULT_TYPE,
     except TelegramError:
         value = random.randint(1, 6)
     if kind == "dice":
-        win = value >= 4
-        multiplier = 1.8
+        win = value >= 3
+        multiplier = 1.55
         label = f"🎲 Выпало число: {value}"
     elif kind == "dart":
-        win = value >= 4
-        multiplier = 1.7
+        win = value >= 3
+        multiplier = 1.55
         label = f"🎯 Результат дартса: {value}"
     else:
-        win = value in {1, 22, 43, 64}
-        multiplier = 9.0 if value == 64 else 4.0 if value in {22, 43} else 2.0
+        win = value % 4 == 0
+        multiplier = 5.0 if value == 64 else 2.35
         label = f"🎰 Результат слота: {value}"
     payout = int(amount * multiplier) if win else 0
     DB.finish_game(game_id, payout, f"Результат игры {kind}")
@@ -1367,22 +1828,32 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user = update.effective_user
     if not message or not user or not message.text:
         return
-    ensure_user(update)
+    row = ensure_user(update)
+    if row and row["blocked"] and user.id != ADMIN_ID:
+        await message.reply_text("❌ Твой аккаунт заблокирован.")
+        return
     text = message.text.strip()
     if await handle_admin_input(update, text):
         return
     lowered = text.lower().strip()
     if lowered in {"б", "баланс"}:
         row = DB.user(user.id)
-        await message.reply_text(f"💰 Твой баланс: {fmt_gava(row['balance'] if row else 0)}")
+        await message.reply_text(
+            f"💰 Твой баланс: {fmt_gava(row['balance'] if row else 0)}",
+            reply_markup=balance_keyboard(user.id),
+        )
         return
     if lowered == "топ":
         await message.reply_text(top_text())
         return
     if re.fullmatch(r"#[a-zA-Z0-9]+", text):
-        status, reward = DB.redeem_promo(text[1:].lower(), user.id)
+        status, reward, remaining, total = DB.redeem_promo(text[1:].lower(), user.id)
         messages = {
-            "ok": f"✅ Промокод активирован!\n🎁 Начислено: {fmt_gava(reward)}",
+            "ok": (
+                f"✅ Промокод активирован!\n"
+                f"🎁 Начислено: {fmt_gava(reward)}\n"
+                f"🎟 Осталось промокодов: {remaining}/{total}"
+            ),
             "missing": "❌ Промокод не найден или выключен.",
             "limit": "❌ Этот промокод больше недоступен.",
             "expired": "❌ Срок действия промокода истёк.",

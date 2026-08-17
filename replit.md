@@ -1,44 +1,48 @@
-# [Project name]
+# GAVA Telegram Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Русскоязычный Telegram-бот с внутренней валютой GAVA, играми, бонусами, переводами, дуэлями, промокодами и админ-панелью.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- `python bot.py` — запуск Telegram-бота
+- `python -m py_compile bot.py` — проверка синтаксиса
+- `pnpm --filter @workspace/api-server run dev` — общий API-сервис шаблона
+- Workflow `GAVA Telegram Bot` — постоянный процесс бота в рабочей среде
+- Required secrets: `TELEGRAM_BOT_TOKEN` (или `BOT_TOKEN`) и `ADMIN_ID`
+- SQLite database: `gava.sqlite3`
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Python 3.11
+- `python-telegram-bot` 22.x
+- SQLite with WAL mode and atomic transactions
+- Replit Secrets and VM deployment for continuous polling
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `bot.py` — обработчики Telegram, игры, админ-панель и слой SQLite
+- `requirements.txt` — Python-зависимость бота
+- `README.md` — настройка BotFather, групп и публикации
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Важные состояния хранятся в SQLite, а не только в памяти процесса.
+- Баланс меняется только внутри транзакций с записью в журнал операций.
+- Callback-кнопки проверяют Telegram ID, ID игры и текущий статус перед выплатой.
+- Для постоянной работы бота нужен VM / Always Running deployment, а не только открытая сессия редактора.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Игроки получают ежедневные бонусы, участвуют в пяти играх на GAVA, переводят валюту, используют промокоды и соревнуются в рейтинге. Администратор управляет пользователями, балансами, бонусами, блокировками и промокодами.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- Пользователь попросил, чтобы сообщения и интерфейс бота были только на русском языке.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- Для текстовых триггеров в группах может потребоваться отключить Privacy Mode через BotFather.
+- Для работы после закрытия Replit проект нужно опубликовать как VM / Always Running.
 
 ## Pointers
 

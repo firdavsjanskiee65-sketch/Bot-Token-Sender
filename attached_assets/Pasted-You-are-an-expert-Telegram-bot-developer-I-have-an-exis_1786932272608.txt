@@ -1,0 +1,229 @@
+You are an expert Telegram bot developer. I have an existing Telegram giveaway bot hosted on Replit. I need you to modify and improve the existing bot without breaking any current features.
+
+IMPORTANT: Do not remove or disable any existing functionality unless explicitly requested below. Keep the current design, database, commands, buttons, and logic that are already working.
+
+1. KEEP THE BOT ONLINE 24/7
+
+The bot currently stops working about 10–15 minutes after I leave Replit. When I return to Replit and open the checkpoint/run the project again, the bot starts working.
+
+Fix the hosting/runtime configuration so the bot can run continuously without requiring me to open Replit or manually run the checkpoint every time.
+
+If the current Replit setup cannot keep the bot online 24/7 on its current plan, configure the project correctly for the available deployment method and clearly explain what needs to be enabled. Do not use fake or unreliable workarounds.
+
+2. PROMO CODE COUNTER
+
+When a user enters a valid promo code and the promo code is successfully accepted, show how many promo codes remain.
+
+Example:
+
+There are 12 total promo codes.
+
+After 9 have been used:
+3/12
+
+The first number must represent the number of unused promo codes remaining.
+The second number must represent the total number of promo codes.
+
+Examples:
+12/12 = 12 remaining
+11/12 = 11 remaining
+5/12 = 5 remaining
+1/12 = 1 remaining
+0/12 = no promo codes remaining
+
+The counter must update automatically after every successful promo code redemption.
+
+IMPORTANT:
+- Invalid promo codes must NOT decrease the counter.
+- A previously used promo code must NOT be usable again.
+- The same user must not be able to abuse or reuse a promo code.
+- The counter must remain accurate after bot restarts.
+- Store the promo-code usage state in the database, not only in temporary memory.
+
+3. MAKE THE GAMES EASIER
+
+The current games are too difficult.
+
+Reduce the difficulty and make the games easier and more enjoyable for normal users.
+
+Do not completely remove the games or change their purpose. Adjust the difficulty, winning conditions, timing, chances, or other appropriate parameters so that users have a more reasonable chance of winning.
+
+Keep the games fair and make sure the changes do not break the existing reward system.
+
+4. IMPORTANT — BONUS BUTTON IN GROUP CHATS
+
+This is very important.
+
+When people use the bot inside Telegram group chats and they type "б", the giveaway bot currently shows their balance as 0 even when they actually have an available bonus.
+
+Fix this behavior.
+
+If the user has an available bonus, the bot's response must contain a "🎁 Bonus" button directly underneath the bot's message.
+
+For example:
+
+Your balance: 0 сомони
+
+🎁 Bonus
+
+When the user presses the "🎁 Bonus" button, the bot must check whether the user has an available bonus.
+
+If a bonus is available:
+- Give the bonus to the user.
+- Update their balance correctly.
+- Show a confirmation message.
+- Prevent the same bonus from being claimed multiple times.
+
+If there is no available bonus:
+- Tell the user that they currently have no available bonus.
+
+IMPORTANT:
+- The bonus button must work correctly in group chats.
+- The user's Telegram ID must be used to identify the correct account.
+- The bot must not accidentally show another user's balance or bonus.
+- The balance must be synchronized with the database.
+- Do not create duplicate bonuses.
+
+5. FULL ADMIN ACCESS
+
+IMPORTANT: Give the administrator full control over the bot.
+
+Use the existing configured ADMIN_ID / administrator Telegram ID. Do not replace it with a random ID and do not hard-code a different user.
+
+Create or improve an Admin Panel that is accessible only to the administrator.
+
+The administrator must be able to:
+
+- View all registered users.
+- View a user's Telegram ID.
+- View their username and name when available.
+- View how much balance/giveaway currency they have.
+- View how many bonuses they have.
+- View their referral information when available.
+- Search for a user by Telegram ID or username.
+- Add balance to any user.
+- Remove balance from any user.
+- Set a user's balance to a specific amount.
+- Give a bonus to a user.
+- Remove a bonus from a user.
+- Block a user.
+- Unblock a user.
+- View blocked users.
+- View the total number of users.
+- View the number of active users.
+- View promo-code statistics.
+- View how many promo codes remain.
+- View how many promo codes have already been used.
+
+BALANCE MANAGEMENT:
+
+The administrator must be able to enter a user's Telegram ID and then choose:
+
+➕ Add balance
+➖ Remove balance
+💰 Set balance
+🎁 Add bonus
+🚫 Block user
+✅ Unblock user
+
+When changing a balance, validate the amount and prevent negative balances unless the administrator intentionally sets the balance to zero.
+
+All balance changes must be saved permanently in the database.
+
+SECURITY:
+
+Only the configured administrator Telegram ID can access the Admin Panel.
+
+Normal users must never be able to access admin functions, even if they manually send admin commands or try to guess callback/button data.
+
+Protect all admin callback handlers and commands with an administrator authorization check.
+
+6. DATABASE AND DATA SAFETY
+
+Do not store important user data only in RAM.
+
+Persist all important information in the database, including:
+
+- Telegram user ID
+- Username
+- Name
+- Balance
+- Bonuses
+- Promo-code usage
+- Referral data
+- Block status
+- Game statistics
+- Other existing user data
+
+The data must remain after the bot restarts or the hosting service restarts.
+
+7. DO NOT BREAK EXISTING FEATURES
+
+Before changing anything, inspect the existing project and understand how the current bot works.
+
+Do not rewrite the entire project unnecessarily.
+
+Preserve:
+- Existing buttons
+- Existing menus
+- Existing languages
+- Existing games
+- Existing giveaway system
+- Existing referral system
+- Existing shop
+- Existing profile
+- Existing balance system
+- Existing promo-code system
+- Existing admin functionality
+- Existing database structure where possible
+
+Only modify the parts that need to be changed or improved.
+
+8. ERROR HANDLING
+
+Add proper error handling so that one user's error does not crash the entire bot.
+
+Handle:
+- Invalid promo codes
+- Already-used promo codes
+- Invalid Telegram IDs
+- Invalid balance amounts
+- Blocked users
+- Missing database records
+- Database errors
+- Invalid callback queries
+- Unexpected user input
+- Bot restart/reconnection
+
+The bot must continue running even if an individual request fails.
+
+9. FINAL REQUIREMENT
+
+After implementing all changes, test the complete bot flow.
+
+Verify that:
+
+- The bot remains online correctly according to the available Replit deployment.
+- Promo-code counters are accurate.
+- Invalid promo codes do not reduce the counter.
+- Used promo codes cannot be reused.
+- Games are easier than before.
+- The "б" command works correctly in group chats.
+- Users with available bonuses see the "🎁 Bonus" button.
+- The bonus button successfully gives the bonus.
+- Bonuses cannot be claimed twice.
+- User balances are accurate.
+- Admin can view users.
+- Admin can add, remove, and set balances.
+- Admin can add/remove bonuses.
+- Admin can block and unblock users.
+- Normal users cannot access admin functions.
+- All important data survives bot restarts.
+
+IMPORTANT:
+Do not just describe what should be changed. Actually implement the changes in the existing project/code.
+
+Do not remove existing features.
+Do not create fake functionality.
+Do not use temporary in-memory storage for important data.
+Keep the bot stable, secure, and production-ready.

@@ -1,0 +1,1 @@
+- [Telegram bot hosting](telegram-bot-hosting.md) — use VM/Always Running for 24/7 polling and suppress verbose HTTP logs that may expose API URLs.
